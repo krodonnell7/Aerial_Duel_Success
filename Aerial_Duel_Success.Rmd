@@ -1,0 +1,636 @@
+---
+title: "StatsBomb"
+author: "Kevin O'Donnell"
+date: "2024-01-28"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Libraries
+```{r}
+library(tidyverse)
+library(StatsBombR)
+library(SBpitch)
+library(ggrepel)
+```
+
+# Loading StatsBomb EPL Event Data
+```{r}
+#EPL 2015-16 only
+prem_comps <- FreeCompetitions() %>% 
+  filter(competition_name == "Premier League",
+         season_id == 27)
+prem_free <- FreeMatches(prem_comps)
+
+prem_event2 <- free_allevents(MatchesDF = prem_free, Parallel = T) 
+clean_prem_event <- allclean(prem_event2)
+```
+
+
+# Filtering for Aerial Duels
+```{r}
+#16,845 aerials won - correspond to the following columns being true
+#even 50/50 split in data
+clean_prem_event %>%
+  select(type.name, clearance.aerial_won, pass.aerial_won, shot.aerial_won, miscontrol.aerial_won) %>%
+  filter(!is.na(clearance.aerial_won) | !is.na(pass.aerial_won) | !is.na(shot.aerial_won) | !is.na(miscontrol.aerial_won))
+
+```
+
+# Quantifying Aerial Duel Success and Success Rate
+```{r}
+#import standings
+standings <- read.csv("standings.csv")
+
+#changing Bournemouth's name
+standings <- standings %>%
+  mutate(Team = ifelse(Team=="Bournemouth", "AFC Bournemouth", Team))
+
+#filtering for aerial duel events
+a_duels <- clean_prem_event %>% 
+  filter(duel.type.name=="Aerial Lost" | !is.na(clearance.aerial_won) | !is.na(pass.aerial_won) | !is.na(shot.aerial_won) | !is.na(miscontrol.aerial_won)) %>% 
+  select(id:position.name, duel.type.id, duel.type.name, duel.outcome.id, duel.outcome.name, clearance.aerial_won, miscontrol.aerial_won, shot.aerial_won, pass.aerial_won, location, location.x, location.y, match_id)
+
+#filtering only for passess off of aerial duels
+passes <- clean_prem_event %>% filter(pass.aerial_won==T)
+
+#creating result column 
+a_duels <- a_duels %>%
+  mutate(clearance.aerial_won = ifelse(clearance.aerial_won==T, "Clearance", clearance.aerial_won),
+         pass.aerial_won = ifelse(pass.aerial_won==T, "Pass", pass.aerial_won),
+         shot.aerial_won = ifelse(shot.aerial_won==T, "Shot", shot.aerial_won),
+         miscontrol.aerial_won = ifelse(miscontrol.aerial_won==T, "Miscontrol", miscontrol.aerial_won))
+
+a_duels <- a_duels %>%
+  mutate(result = coalesce(duel.type.name, clearance.aerial_won, pass.aerial_won, shot.aerial_won, miscontrol.aerial_won))
+
+#creating duel win column (1 if won, 0 if lost)
+a_duels <- a_duels %>%
+  mutate(W = (result !="Aerial Lost"))
+
+# Overall breakdown of result types
+a_duels %>%
+  group_by(result) %>%
+  summarise(pct = n()/nrow(a_duels), n=n())
+
+# breakdown of result types by team
+a_duels %>%
+  group_by(team.name, result) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(team.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(team.name, -pct)
+
+# breakdown of W vs L by team
+a_duels %>%
+  group_by(team.name, W = (result !="Aerial Lost")) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(team.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(-pct) %>%
+  filter(W==T) %>%
+  select(-W) 
+
+# breakdown of result types by player (min 45 duels - Q1)
+a_duels %>%
+  group_by(player.name, result) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(player.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(result, -pct) %>%
+  filter(n2>45)
+
+# breakdown of W vs L by player (min 45 duels - Q1)
+a_duels %>%
+  group_by(player.name, W = (result !="Aerial Lost")) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(player.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(-pct) %>%
+  filter(W==T, n2>45) 
+```
+
+# Visualizing Duel Success Spatially
+```{r}
+#note: right side is attacking, left is defending
+
+#heatmap - splitting into 24 even zones
+heatmap <- a_duels
+heatmap$xbin <- cut(heatmap$location.x, breaks = seq(from=0, to=120, by = 20),include.lowest=TRUE )
+heatmap$ybin <- cut(heatmap$location.y, breaks = seq(from=0, to=80, by = 20),include.lowest=TRUE) 
+
+#plotting mean win rate of duels for each team compared to average (pure wins and losses, not long term)
+heatmap = heatmap %>%
+  group_by(team.name) %>%
+  mutate(success_rate = mean(W),
+       n = n()) %>%
+  group_by(team.name, xbin, ybin) %>%
+  summarise(success_rate = max(success_rate),
+          n=max(n),
+          bin_duels_success_rate = mean(W),
+          bin_duel_n = n(),
+          location.x = median(location.x),
+          location.y = median(location.y)) %>%
+  group_by(xbin, ybin) %>%
+  mutate(league_ave = mean(bin_duels_success_rate)) %>%
+  group_by(team.name, xbin, ybin) %>%
+  mutate(diff_vs_ave = bin_duels_success_rate - league_ave)
+
+
+library(grid)
+defensiveactivitycolors <- c("#dc2429", "#dc2329", "#df272d", "#df3238", "#e14348", "#e44d51",
+"#e35256", "#e76266", "#e9777b", "#ec8589", "#ec898d", "#ef9195",
+"#ef9ea1", "#f0a6a9", "#f2abae", "#f4b9bc", "#f8d1d2", "#f9e0e2",
+"#f7e1e3", "#f5e2e4", "#d4d5d8", "#d1d3d8", "#cdd2d6", "#c8cdd3", "#c0c7cd",
+"#b9c0c8", "#b5bcc3", "#909ba5", "#8f9aa5", "#818c98", "#798590",
+"#697785", "#526173", "#435367", "#3a4b60", "#2e4257", "#1d3048",
+"#11263e", "#11273e", "#0d233a", "#020c16") 
+
+ggplot(data= heatmap %>% filter(bin_duel_n>10, ), aes(x = location.x, y = location.y, fill = diff_vs_ave, group =diff_vs_ave)) +
+ geom_bin2d(binwidth = c(20, 20), position = "identity", alpha = 0.9) + #2
+ annotate("rect",xmin = 0, xmax = 120, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 60, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 18, xmax = 0, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 6, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 114, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 120.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = -0.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("segment", x = 60, xend = 60, y = -0.5, yend = 80.5, colour = "white", size = 0.6)+
+ annotate("segment", x = 0, xend = 0, y = 0, yend = 80, colour = "black", size = 0.6)+
+ annotate("segment", x = 120, xend = 120, y = 0, yend = 80, colour = "black", size = 0.6)+
+ theme(rect = element_blank(),
+ line = element_blank()) +
+ annotate("point", x = 12 , y = 40, colour = "white", size = 1.05) +
+ annotate("point", x = 108 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", colour = "white", size = 0.6,
+ x=60+10*cos(seq(0,2*pi,length.out=2000)),
+ y=40+10*sin(seq(0,2*pi,length.out=2000)))+
+ annotate("point", x = 60 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", x=12+10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40+10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+ annotate("path", x=108-10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40-10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+theme(axis.text.x=element_blank(),
+ axis.title.x = element_blank(),
+ axis.title.y = element_blank(),
+ plot.caption=element_text(size=8,family="Arial", hjust=0.5, vjust=0.5),
+ plot.subtitle = element_text(size = 13, family="Arial", hjust = 0.5),
+ axis.text.y=element_blank(),
+ legend.title = element_blank(),
+ legend.text=element_text(size=8,family="Arial"),
+ legend.key.size = unit(.5, "cm"),
+ plot.title = element_text(margin = margin(r = 10, b = 10), face="bold",size = 15,
+family="Arial", colour = "black", hjust = 0.5),
+ legend.direction = "vertical",
+ axis.ticks=element_blank(),
+ plot.background = element_rect(fill = "white"),
+ strip.text.x = element_text(size=7,family="Arial")) + #4
+ scale_y_reverse() + #5
+ scale_fill_gradientn(colours = defensiveactivitycolors, trans = "reverse", labels =
+scales::percent_format(accuracy = 1), limits = c(0.20, -0.20), breaks = scales::breaks_extended(n = 9)) + #6
+ labs(title = "Duel Win Rate vs League Average", subtitle = "EPL, 2015/16") + #7
+ coord_fixed(ratio = 95/100) +
+ annotation_custom(grob = linesGrob(arrow=arrow(type="open", ends="last",
+ length=unit(2.55,"mm")), gp=gpar(col="black", fill=NA, lwd=2.2)),
+ xmin=25, xmax = 95, ymin = -83, ymax = -83) + #9
+ facet_wrap(~team.name)+ #10
+ guides(fill = guide_legend(reverse = TRUE)) 
+```
+
+# Defining Longer Term Duel Success - Did it lead to above average possession length, shot, etc.
+```{r}
+#distribution of possession time
+clean_prem_event %>%
+  group_by(match_id, possession) %>%
+  slice(n()) %>%
+  ggplot(aes(x=TimeInPoss)) +
+  geom_boxplot()
+
+summary((clean_prem_event %>%
+  group_by(match_id, possession) %>%
+  slice(n()))$TimeInPoss)
+#mean = 23.329
+#median = 11.708
+
+#filtering event data to only passes (specific type of win that would extend possession)
+#also including the event directly following passses to ensure that the same possession is captured
+one_after <- clean_prem_event %>% 
+  filter((!is.na(pass.aerial_won)) | (!is.na(lag(pass.aerial_won,1)))) %>% 
+  select(id:position.name, duel.type.id, duel.type.name, duel.outcome.id, duel.outcome.name, clearance.aerial_won, miscontrol.aerial_won, shot.aerial_won, pass.aerial_won, location, location.x, location.y, match_id) %>%
+  mutate(match_pos = paste(match_id, possession))
+
+#pulling final play of ensuing possession following duel win
+post_duels <- clean_prem_event %>% 
+  mutate(match_pos = paste(match_id, possession)) %>%
+  filter(match_pos %in% unique(one_after$match_pos)) %>%
+  group_by(match_id, possession) %>%
+  slice(n())
+
+post_duels %>% 
+  group_by(type.name) %>%
+  summarise(n=n()) %>%
+  arrange(-n)
+#successful endings: possession > average possession time, foul won, goal keeper, shot
+
+# now get possession time for those possessions, join with duels
+a_duels <- a_duels %>%  mutate(match_pos = paste(match_id, possession))
+
+duel_and_post <- post_duels %>%
+  select(match_pos, TimeInPoss, type.name.end = type.name) %>%
+  right_join(a_duels, by='match_pos')
+
+#creating long-term success variable/metric
+duel_and_post <- duel_and_post %>%
+  mutate(success = ifelse(W==T & (TimeInPoss>23.329 |
+                            result=="Shot" |
+                            type.name.end %in% c("Foul Won", "Goal Keeper", "Shot")), 1, 0)) %>%
+  mutate(success = ifelse(is.na(success), 0, success)) %>%
+  mutate(end_in_shot = ifelse(W==T & 
+                            (result=="Shot" |
+                            type.name.end %in% c("Foul Won", "Goal Keeper", "Shot")), 1, 0)) %>%
+  mutate(end_in_shot = ifelse(is.na(end_in_shot), 0, end_in_shot))
+
+#breakdown of success to failure for LDSR
+duel_and_post %>% group_by(success) %>%
+  summarise(n())
+```
+
+# Comparing and Visualizing Duel Win Rate + Long Term Duel Success
+```{r}
+#team success rate and shot rate (possession ends in shot)
+success_shot_rate_team <- duel_and_post %>%
+  group_by(team.name) %>%
+  filter(W==T) %>%
+  summarise(success_rate = mean(success), shot_rate = mean(end_in_shot)) %>%
+  arrange(-success_rate)
+
+#joining team success rates with standings
+success_shot_rate_team <- left_join(success_shot_rate_team, standings, by=c('team.name'='Team'))
+
+#correlation between success rate and points in the table
+cor(success_shot_rate_team$success_rate, success_shot_rate_team$Pts)
+
+#saving win rate by team
+win_rate_team <- a_duels %>%
+  group_by(team.name, W = (result !="Aerial Lost")) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(team.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(-pct) %>%
+  filter(W==T) 
+
+#joining team table with win rate
+success_shot_rate_team <- left_join(success_shot_rate_team, win_rate_team, by=c('team.name'))
+
+#correlation between success rate and win rate
+cor(success_shot_rate_team$success_rate, success_shot_rate_team$pct)
+cor(filter(success_shot_rate_team, !team.name %in% c("Aston Villa", "Leicester City"))$success_rate, filter(success_shot_rate_team, !team.name %in% c("Aston Villa", "Leicester City"))$Pts)
+
+#correlation between win rate and points in table
+cor(success_shot_rate_team$pct, success_shot_rate_team$Pts)
+cor(filter(success_shot_rate_team, !team.name %in% c("Aston Villa", "Leicester City"))$pct, filter(success_shot_rate_team, !team.name %in% c("Aston Villa", "Leicester City"))$Pts)
+
+#plotting duel win rate vs points
+ggplot(success_shot_rate_team, aes(Pts, pct)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "#dc2429", se = FALSE, linetype="dashed", alpha=0.6) +
+  theme(
+    axis.text.y = element_text(size = 11, color = "#333333", family = "Arial"),
+    axis.title = element_text(size = 12, color = "#333333", family = "Arial"),
+    axis.text.x = element_text(size = 11, color = "#333333", family = "Arial"),
+    axis.ticks = element_line(),
+    panel.background = element_rect(fill = "white", colour = "white"),
+    plot.background = element_rect(fill = "white", colour = "white"),
+    panel.grid.major = element_line(color = "gray", linetype = "dashed"),  # Add gridlines
+    panel.grid.minor = element_line(color = "gray", linetype = "dashed"),  # Add gridlines
+    plot.title = element_text(size = 16, color = "#333333", family = "Arial", face = "bold"),
+    plot.subtitle = element_text(size = 14, color = "#333333", family = "Arial", face = "bold"),
+    plot.caption = element_text(color = "#333333", family = "Arial", size = 10),
+    text = element_text(family = "Arial"),
+    legend.title = element_blank()
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Aerial Duel Win Rate vs Points", subtitle = "EPL, 2015/16", x = "Points", y = "Duel Win Rate") +
+  geom_label_repel(aes(label = team.name), data = success_shot_rate_team %>% filter(team.name %in% c("Aston Villa", "Leicester City")), box.padding = 0.5)
+
+
+#plotting long term success rate vs points
+ggplot(success_shot_rate_team, aes(Pts, success_rate)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "#dc2429", se = FALSE, linetype="dashed", alpha=0.6) +
+  theme(
+    axis.text.y = element_text(size = 11, color = "#333333", family = "Arial"),
+    axis.title = element_text(size = 12, color = "#333333", family = "Arial"),
+    axis.text.x = element_text(size = 11, color = "#333333", family = "Arial"),
+    axis.ticks = element_line(),
+    panel.background = element_rect(fill = "white", colour = "white"),
+    plot.background = element_rect(fill = "white", colour = "white"),
+    panel.grid.major = element_line(color = "gray", linetype = "dashed"),  # Add gridlines
+    panel.grid.minor = element_line(color = "gray", linetype = "dashed"),  # Add gridlines
+    plot.title = element_text(size = 16, color = "#333333", family = "Arial", face = "bold"),
+    plot.subtitle = element_text(size = 14, color = "#333333", family = "Arial", face = "bold"),
+    plot.caption = element_text(color = "#333333", family = "Arial", size = 10),
+    text = element_text(family = "Arial"),
+    legend.title = element_blank()
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Long-Term Duel Success Rate vs Points", subtitle = "EPL, 2015/16", x = "Points", y = "Long-Term Duel Success Rate (LDSR)") +
+  geom_label_repel(aes(label = team.name), data = success_shot_rate_team %>% filter(team.name %in% c("Aston Villa", "Leicester City", "Arsenal", "Newcastle United")), box.padding = 0.7)
+
+
+#player success rates
+#note: LDSR is more of a team metric because it is dependent on how the team capitalizes on aerial wins, not just how often individual players win their duels. This metric is computed for players for exploratory purposes 
+success_shot_rate_player <- duel_and_post %>%
+  group_by(player.name) %>%
+  #filter(W==T) %>%
+  summarise(success_rate = mean(success), shot_rate = mean(end_in_shot), n=n(), position.id) %>%
+  arrange(-success_rate) %>%
+  mutate(position_group = case_when(position.id<=8 ~ "Defender",
+                                    position.id==17 | position.id>=21 ~ "Attacker",
+                                    .default = "Midfielder")) %>%
+  select(-position.id) %>%
+  unique()
+
+#most successful players above 45 duels attempted
+success_shot_rate_player %>%
+  filter(n>45) %>%
+  arrange(-success_rate)
+
+#saving win rate by player
+win_rate_player <- a_duels %>%
+  group_by(player.name, W = (result !="Aerial Lost")) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  group_by(player.name) %>%
+  mutate(n2=sum(n), pct=n/n2) %>%
+  arrange(-pct) %>%
+  filter(W==T) 
+
+#joining player table with win rate
+success_shot_rate_player <- left_join(success_shot_rate_player, win_rate_player, by='player.name')
+
+#correlation between win rate and success rate on player level 
+cor(success_shot_rate_player$pct, success_shot_rate_player$success_rate, use = "complete.obs")
+
+cor(filter(success_shot_rate_player, n.x>45)$pct, filter(success_shot_rate_player, n.x>45)$success_rate, use = "complete.obs")
+cor(filter(success_shot_rate_player, n.x>45)$pct, filter(success_shot_rate_player, n.x>45)$shot_rate, use = "complete.obs")
+
+#plot of win rate and success rate on player level 
+ggplot(filter(success_shot_rate_player, n.x>45), aes(x=pct, y=success_rate)) +
+  geom_point() 
+
+#success rates and win rates by position group (attacker, defender, midfielder)
+success_shot_rate_player %>%
+  group_by(position_group) %>%
+  summarise(mean(success_rate), mean(shot_rate), mean(n.x), mean(pct, na.rm=T))
+```
+
+# Visualizing Long Term Duel Success Spatially
+```{r}
+#heatmap 
+heatmap <- duel_and_post
+heatmap$xbin <- cut(heatmap$location.x, breaks = seq(from=0, to=120, by = 20),include.lowest=TRUE )
+heatmap$ybin <- cut(heatmap$location.y, breaks = seq(from=0, to=80, by = 20),include.lowest=TRUE) 
+
+#plotting mean success rate of duels for each team compared to average
+heatmap = heatmap %>%
+  group_by(team.name) %>%
+  mutate(success_rate = mean(success),
+       n = n()) %>%
+  group_by(team.name, xbin, ybin) %>%
+  summarise(success_rate = max(success_rate),
+          n=max(n),
+          bin_duels_success_rate = mean(success),
+          bin_duel_n = n(),
+          location.x = median(location.x),
+          location.y = median(location.y)) %>%
+  group_by(xbin, ybin) %>%
+  mutate(league_ave = mean(bin_duels_success_rate)) %>%
+  group_by(team.name, xbin, ybin) %>%
+  mutate(diff_vs_ave = bin_duels_success_rate - league_ave)
+
+
+library(grid)
+defensiveactivitycolors <- c("#dc2429", "#dc2329", "#df272d", "#df3238", "#e14348", "#e44d51",
+"#e35256", "#e76266", "#e9777b", "#ec8589", "#ec898d", "#ef9195",
+"#ef9ea1", "#f0a6a9", "#f2abae", "#f4b9bc", "#f8d1d2", "#f9e0e2",
+"#f7e1e3", "#f5e2e4", "#d4d5d8", "#d1d3d8", "#cdd2d6", "#c8cdd3", "#c0c7cd",
+"#b9c0c8", "#b5bcc3", "#909ba5", "#8f9aa5", "#818c98", "#798590",
+"#697785", "#526173", "#435367", "#3a4b60", "#2e4257", "#1d3048",
+"#11263e", "#11273e", "#0d233a", "#020c16") 
+
+ggplot(data= heatmap %>% filter(bin_duel_n>10, ), aes(x = location.x, y = location.y, fill = diff_vs_ave, group =diff_vs_ave)) +
+ geom_bin2d(binwidth = c(20, 20), position = "identity", alpha = 0.9) + #2
+ annotate("rect",xmin = 0, xmax = 120, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 60, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 18, xmax = 0, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 6, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 114, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 120.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = -0.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("segment", x = 60, xend = 60, y = -0.5, yend = 80.5, colour = "white", size = 0.6)+
+ annotate("segment", x = 0, xend = 0, y = 0, yend = 80, colour = "black", size = 0.6)+
+ annotate("segment", x = 120, xend = 120, y = 0, yend = 80, colour = "black", size = 0.6)+
+ theme(rect = element_blank(),
+ line = element_blank()) +
+ annotate("point", x = 12 , y = 40, colour = "white", size = 1.05) +
+ annotate("point", x = 108 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", colour = "white", size = 0.6,
+ x=60+10*cos(seq(0,2*pi,length.out=2000)),
+ y=40+10*sin(seq(0,2*pi,length.out=2000)))+
+ annotate("point", x = 60 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", x=12+10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40+10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+ annotate("path", x=108-10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40-10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+theme(axis.text.x=element_blank(),
+ axis.title.x = element_blank(),
+ axis.title.y = element_blank(),
+ plot.caption=element_text(size=8,family="Arial", hjust=0.5, vjust=0.5),
+ plot.subtitle = element_text(size = 13, family="Arial", hjust = 0.5),
+ axis.text.y=element_blank(),
+ legend.title = element_blank(),
+ legend.text=element_text(size=8,family="Arial"),
+ legend.key.size = unit(.5, "cm"),
+ plot.title = element_text(margin = margin(r = 10, b = 10), face="bold",size = 15,
+family="Arial", colour = "black", hjust = 0.5),
+ legend.direction = "vertical",
+ axis.ticks=element_blank(),
+ plot.background = element_rect(fill = "white"),
+ strip.text.x = element_text(size=7,family="Arial")) + #4
+ scale_y_reverse() + #5
+ scale_fill_gradientn(colours = defensiveactivitycolors, trans = "reverse", labels =
+scales::percent_format(accuracy = 1), limits = c(0.20, -0.20), breaks = scales::breaks_extended(n = 9)) + #6
+ labs(title = "Long Term Duel Success Rate vs League Average", subtitle = "EPL, 2015/16") + #7
+ coord_fixed(ratio = 95/100) +
+ annotation_custom(grob = linesGrob(arrow=arrow(type="open", ends="last",
+ length=unit(2.55,"mm")), gp=gpar(col="black", fill=NA, lwd=2.2)),
+ xmin=25, xmax = 95, ymin = -83, ymax = -83) + #9
+ facet_wrap(~team.name)+ #10
+ guides(fill = guide_legend(reverse = TRUE)) 
+```
+
+
+# Correlation of Long Term Success Rate in Each Zone with Winning (Pts)
+```{r}
+heatmap <- duel_and_post
+heatmap$xbin <- cut(heatmap$location.x, breaks = seq(from=0, to=120, by = 20),include.lowest=TRUE )
+heatmap$ybin <- cut(heatmap$location.y, breaks = seq(from=0, to=80, by = 20),include.lowest=TRUE) 
+
+#plotting correlation of success rate to points across the field (split into thirds)
+heatmap = heatmap %>%
+  group_by(team.name) %>%
+  mutate(success_rate = mean(success),
+       n = n()) %>%
+  group_by(team.name, xbin, ybin) %>%
+  summarise(success_rate = max(success_rate),
+          n=max(n),
+          bin_duels_success_rate = mean(success),
+          bin_duel_n = n(),
+          location.x = median(location.x),
+          location.y = median(location.y)) %>%
+  group_by(xbin, ybin) %>%
+  mutate(league_ave = mean(bin_duels_success_rate)) %>%
+  group_by(team.name, xbin, ybin) %>%
+  mutate(diff_vs_ave = bin_duels_success_rate - league_ave)
+
+corr_map <- heatmap %>%
+  left_join(standings, by=c('team.name'='Team')) %>%
+  group_by(xbin, ybin) %>%
+  summarise(correlation = cor(diff_vs_ave, Pts, use = "complete.obs"), location.x =median(location.x), location.y =median(location.y)) %>%
+  arrange(-correlation)
+
+
+ggplot(data= corr_map, aes(x = location.x, y = location.y, fill = correlation, group =correlation)) +
+ geom_bin2d(binwidth = c(20, 20), position = "identity", alpha = 0.9) + #2
+ annotate("rect",xmin = 0, xmax = 120, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 60, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 18, xmax = 0, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 6, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 114, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 120.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = -0.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("segment", x = 60, xend = 60, y = -0.5, yend = 80.5, colour = "white", size = 0.6)+
+ annotate("segment", x = 0, xend = 0, y = 0, yend = 80, colour = "black", size = 0.6)+
+ annotate("segment", x = 120, xend = 120, y = 0, yend = 80, colour = "black", size = 0.6)+
+ theme(rect = element_blank(),
+ line = element_blank()) +
+ annotate("point", x = 12 , y = 40, colour = "white", size = 1.05) +
+ annotate("point", x = 108 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", colour = "white", size = 0.6,
+ x=60+10*cos(seq(0,2*pi,length.out=2000)),
+ y=40+10*sin(seq(0,2*pi,length.out=2000)))+
+ annotate("point", x = 60 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", x=12+10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40+10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+ annotate("path", x=108-10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40-10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+theme(axis.text.x=element_blank(),
+ axis.title.x = element_blank(),
+ axis.title.y = element_blank(),
+ plot.caption=element_text(size=8,family="Arial", hjust=0.5, vjust=0.5),
+ plot.subtitle = element_text(size = 10, family="Arial", hjust = 0.5),
+ axis.text.y=element_blank(),
+ legend.title = element_blank(),
+ legend.text=element_text(size=8,family="Arial"),
+ legend.key.size = unit(.5, "cm"),
+ plot.title = element_text(margin = margin(r = 10, b = 10), face="bold",size = 12,
+family="Arial", colour = "black", hjust = 0.5),
+ legend.direction = "vertical",
+ axis.ticks=element_blank(),
+ plot.background = element_rect(fill = "white"),
+ strip.text.x = element_text(size=7,family="Arial")) + #4
+ scale_y_reverse() + #5
+ scale_fill_gradientn(colours = defensiveactivitycolors, trans = "reverse", labels =
+scales::percent_format(accuracy = 1), limits = c(0.50, -0.50), breaks = scales::breaks_extended(n = 9)) + #6
+ labs(title = "Correlation between Long Term Duel Success Rate and Cumulative Points", subtitle = "EPL Teams, 2015/16") + #7
+ coord_fixed(ratio = 95/100) +
+ annotation_custom(grob = linesGrob(arrow=arrow(type="open", ends="last",
+ length=unit(2.55,"mm")), gp=gpar(col="black", fill=NA, lwd=2.2)),
+ xmin=25, xmax = 95, ymin = -83, ymax = -83) + #9
+ guides(fill = guide_legend(reverse = TRUE)) 
+```
+
+
+# Correlation of Long Term Success Rate in Each Zone with Winning (Pts)
+```{r}
+heatmap <- duel_and_post
+heatmap$xbin <- cut(heatmap$location.x, breaks = seq(from=0, to=120, by = 20),include.lowest=TRUE )
+heatmap$ybin <- cut(heatmap$location.y, breaks = seq(from=0, to=80, by = 20),include.lowest=TRUE) 
+
+#plotting correlation of long-term success rate in each zone with points
+heatmap = heatmap %>%
+  group_by(xbin, ybin) %>%
+  summarise(success = sum(success),
+       n = n(),
+       location.x = median(location.x),
+      location.y = median(location.y)) %>%
+  mutate(failure = n-success,
+         pct = success/n)
+
+
+ggplot(data= heatmap, aes(x = location.x, y = location.y, fill = pct, group =pct)) +
+ geom_bin2d(binwidth = c(20, 20), position = "identity", alpha = 0.9) + #2
+ annotate("rect",xmin = 0, xmax = 120, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 60, ymin = 0, ymax = 80, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 18, xmax = 0, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = 6, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 114, ymin = 30, ymax = 50, fill = NA, colour = "white", size = 0.6) +
+ annotate("rect",xmin = 120, xmax = 120.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("rect",xmin = 0, xmax = -0.5, ymin =36, ymax = 44, fill = NA, colour = "black", size = 0.6) +
+ annotate("segment", x = 60, xend = 60, y = -0.5, yend = 80.5, colour = "white", size = 0.6)+
+ annotate("segment", x = 0, xend = 0, y = 0, yend = 80, colour = "black", size = 0.6)+
+ annotate("segment", x = 120, xend = 120, y = 0, yend = 80, colour = "black", size = 0.6)+
+ theme(rect = element_blank(),
+ line = element_blank()) +
+ annotate("point", x = 12 , y = 40, colour = "white", size = 1.05) +
+ annotate("point", x = 108 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", colour = "white", size = 0.6,
+ x=60+10*cos(seq(0,2*pi,length.out=2000)),
+ y=40+10*sin(seq(0,2*pi,length.out=2000)))+
+ annotate("point", x = 60 , y = 40, colour = "white", size = 1.05) +
+ annotate("path", x=12+10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40+10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+ annotate("path", x=108-10*cos(seq(-0.3*pi,0.3*pi,length.out=30)), size = 0.6,
+ y=40-10*sin(seq(-0.3*pi,0.3*pi,length.out=30)), col="white") +
+theme(axis.text.x=element_blank(),
+ axis.title.x = element_blank(),
+ axis.title.y = element_blank(),
+ plot.caption=element_text(size=8,family="Arial", hjust=0.5, vjust=0.5),
+ plot.subtitle = element_text(size = 10, family="Arial", hjust = 0.5),
+ axis.text.y=element_blank(),
+ legend.title = element_blank(),
+ legend.text=element_text(size=8,family="Arial"),
+ legend.key.size = unit(.5, "cm"),
+ plot.title = element_text(margin = margin(r = 10, b = 10), face="bold",size = 12,
+family="Arial", colour = "black", hjust = 0.5),
+ legend.direction = "vertical",
+ axis.ticks=element_blank(),
+ plot.background = element_rect(fill = "white"),
+ strip.text.x = element_text(size=7,family="Arial")) + #4
+ scale_y_reverse() + #5
+ scale_fill_gradientn(colours = defensiveactivitycolors, trans = "reverse", labels =
+scales::percent_format(accuracy = 1), limits = c(.4, 0), breaks = scales::breaks_extended(n = 9)) + #6
+ labs(title = "Long Term Duel Success Rate by Zone", subtitle = "EPL League Average, 2015/16") + #7
+ coord_fixed(ratio = 95/100) +
+ annotation_custom(grob = linesGrob(arrow=arrow(type="open", ends="last",
+ length=unit(2.55,"mm")), gp=gpar(col="black", fill=NA, lwd=2.2)),
+ xmin=25, xmax = 95, ymin = -83, ymax = -83) + #9
+ guides(fill = guide_legend(reverse = TRUE)) 
+```
+
+
+
+
